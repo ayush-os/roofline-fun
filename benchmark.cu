@@ -12,6 +12,9 @@
     } \
 }
 
+// Tile size for Shared Memory GEMM
+const int TILE_SIZE = 32;
+
 struct BenchResult {
     std::string name;
     double time_ms;
@@ -55,34 +58,48 @@ __global__ void naiveGEMM(const float* a, const float* b, float* c, int N) {
     }
 }
 
-// 3. Fused Multiply-Add Stress (Peak FLOPs test)
-__global__ void fmaStress(float* out, int iterations) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    float val = (float)i;
-    float multiplier = 1.000001f;
-    #pragma unroll
-    for (int j = 0; j < iterations; j++) {
-        val = fma(val, multiplier, 0.5f); // Use FMA instruction specifically
+// 2. Tiled Shared Memory GEMM (New)
+__global__ void sharedMemoryGEMM(const float* A, const float* B, float* C, int N) {
+    // Allocate shared memory for tiles
+    __shared__ float s_A[TILE_SIZE][TILE_SIZE];
+    __shared__ float s_B[TILE_SIZE][TILE_SIZE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * TILE_SIZE + ty;
+    int col = blockIdx.x * TILE_SIZE + tx;
+
+    float tmp = 0.0f;
+
+    // Loop over tiles required to compute the result
+    for (int t = 0; t < (N + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        // Collaborative Load: Each thread loads one element of the tile into shared memory
+        if (row < N && (t * TILE_SIZE + tx) < N)
+            s_A[ty][tx] = A[row * N + t * TILE_SIZE + tx];
+        else
+            s_A[ty][tx] = 0.0f;
+
+        if (col < N && (t * TILE_SIZE + ty) < N)
+            s_B[ty][tx] = B[(t * TILE_SIZE + ty) * N + col];
+        else
+            s_B[ty][tx] = 0.0f;
+
+        // Ensure all threads have finished loading tiles
+        __syncthreads();
+
+        // Compute partial product from this tile
+        #pragma unroll
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            tmp += s_A[ty][k] * s_B[k][tx];
+        }
+
+        // Wait for all threads before moving to the next tile
+        __syncthreads();
     }
-    out[i] = val;
-}
 
-#include <mma.h>
-using namespace nvcuda;
-
-__global__ void tensorCoreGEMM(const half* a, const half* b, float* c) {
-    // Fragment storage for Tensor Core operations
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    // Load, Multiply-Accumulate, and Store
-    wmma::load_matrix_sync(a_frag, a, 16);
-    wmma::load_matrix_sync(b_frag, b, 16);
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-    wmma::store_matrix_sync(c, c_frag, 16, wmma::mem_row_major);
+    if (row < N && col < N) {
+        C[row * N + col] = tmp;
+    }
 }
 
 // --- RUNNER LOGIC ---
@@ -118,17 +135,25 @@ void runBenchmarks() {
     CHECK_CUDA(cudaMalloc(&d_matB, mat_bytes));
     CHECK_CUDA(cudaMalloc(&d_matC, mat_bytes));
 
+    GPUTimer timer;
+    double flops = 2.0 * MAT_SIZE * MAT_SIZE * MAT_SIZE;
+
+    // --- Naive Benchmark ---
     dim3 block_dim(32, 32);
     dim3 grid_dim((MAT_SIZE + 31) / 32, (MAT_SIZE + 31) / 32);
     
     timer.Start();
     naiveGEMM<<<grid_dim, block_dim>>>(d_matA, d_matB, d_matC, MAT_SIZE);
     timer.Stop();
+    std::cout << std::left << std::setw(20) << "NaiveGEMM:" << timer.Elapsed() << " ms | " 
+              << (flops / 1e12) / (timer.Elapsed() / 1000.0) << " TFLOPS" << std::endl;
 
-    float gemm_ms = timer.Elapsed();
-    double flops = 2.0 * MAT_SIZE * MAT_SIZE * MAT_SIZE;
-    double gemm_tflops = (flops / 1e12) / (gemm_ms / 1000.0);
-    std::cout << "NaiveGEMM: " << gemm_ms << " ms | TFLOPS: " << gemm_tflops << std::endl;
+    // --- Shared Memory (Tiled) Benchmark ---
+    timer.Start();
+    sharedMemoryGEMM<<<grid_dim, block_dim>>>(d_matA, d_matB, d_matC, MAT_SIZE);
+    timer.Stop();
+    std::cout << std::left << std::setw(20) << "SharedMemGEMM:" << timer.Elapsed() << " ms | " 
+              << (flops / 1e12) / (timer.Elapsed() / 1000.0) << " TFLOPS" << std::endl;
 
     cudaFree(d_a); cudaFree(d_b); cudaFree(d_c);
     cudaFree(d_matA); cudaFree(d_matB); cudaFree(d_matC);
