@@ -135,7 +135,6 @@ void runBenchmarks() {
     CHECK_CUDA(cudaMalloc(&d_matB, mat_bytes));
     CHECK_CUDA(cudaMalloc(&d_matC, mat_bytes));
 
-    GPUTimer timer;
     double flops = 2.0 * MAT_SIZE * MAT_SIZE * MAT_SIZE;
 
     // --- Naive Benchmark ---
